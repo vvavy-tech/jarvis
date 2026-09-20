@@ -37,6 +37,13 @@ from integrations import (
     ToolGroup,
     build_default_registry,
 )
+from memory.auto import AutoMemoryController, AutoMemoryPipeline, AutoMemoryResult
+from memory.config import default_memory_db_path
+from memory.local_sqlite import LocalSQLiteMemoryProvider
+from memory.manager import MemoryManager
+from memory.policy import MAX_MEMORY_CONTEXT_CHARS, MemoryPolicy
+from memory.prompt import memory_instructions
+from memory.router import MemoryIntent, MemoryRouter
 from tools import BrowserTools, DeveloperTools
 
 logger = logging.getLogger("agent")
@@ -46,6 +53,11 @@ load_dotenv(".env.local")
 browser = BrowserManager(headless=False)
 
 hermes_agent = HermesAgent()
+
+memory_db_path = default_memory_db_path()
+memory_provider = LocalSQLiteMemoryProvider(path=memory_db_path)
+memory_router = MemoryRouter(provider=memory_provider, policy=MemoryPolicy())
+logger.info("MEMORY DB: %s", memory_db_path)
 
 developer_failures = FailureLog()
 developer_tasks = TaskManager()
@@ -58,6 +70,7 @@ developer = Developer(
     git=developer_git,
     runner=developer_runner,
     hermes=hermes_agent,
+    memory=MemoryManager(memory_provider, MemoryPolicy()),
 )
 
 gate = ToolGate()
@@ -74,6 +87,7 @@ capability_registry = build_default_registry(
     gate=gate,
     failure_log=developer_failures,
     hermes_agent=hermes_agent,
+    memory_provider=memory_provider,
     external_groups=[
         ToolGroup(
             "browser",
@@ -118,6 +132,31 @@ maintenance_scheduler = MaintenanceScheduler(
 WAKE_WORD_SETTLE_S = float(os.environ.get("JARVIS_WAKE_WORD_SETTLE_S", "5.0"))
 _MAX_BUFFERED_OUTPUT_FRAMES = int(
     os.environ.get("JARVIS_MAX_BUFFERED_OUTPUT_FRAMES", "500")
+)
+# Voice-first: the deterministic memory router stays out of the live transcript
+# path until the voice loop is proven stable again. Enable deliberately via
+# JARVIS_MEMORY_ROUTING=true once realtime voice regressions have been resolved.
+MEMORY_ROUTING_LIVE = os.environ.get("JARVIS_MEMORY_ROUTING", "").strip().lower() in {
+    "1",
+    "true",
+    "on",
+    "yes",
+}
+
+# Opt-in safe automatic memory: a background, failure-isolated layer that
+# observes only final accepted transcripts. It never awaits the realtime reply
+# path, never calls generate_reply itself, and never raises into the voice
+# loop. Off by default for voice-first stability; enable deliberately via
+# JARVIS_AUTO_MEMORY=true.
+AUTO_MEMORY_ENABLED = os.environ.get("JARVIS_AUTO_MEMORY", "").strip().lower() in {
+    "1",
+    "true",
+    "on",
+    "yes",
+}
+
+auto_memory_pipeline = AutoMemoryPipeline(
+    provider=memory_provider, policy=MemoryPolicy()
 )
 
 
@@ -298,12 +337,17 @@ class Assistant(Agent):
                 knows, then continue helping normally. All screen tools are
                 read-only unless the user separately asks you to change
                 something.
+
                 """
-            ),
+            )
+            + "\n"
+            + memory_instructions(),
         )
         self._turn_text: str = ""
         self._gate: ToolGate = browser_tools.gate
         self._wakeword_attached = False
+        self._memory_tasks: set[asyncio.Task] = set()
+        self._auto_memory = AutoMemoryController(auto_memory_pipeline)
 
     def attach_wakeword_gate(self) -> None:
         if self._wakeword_attached:
@@ -311,6 +355,7 @@ class Assistant(Agent):
         session = self.session
         if session is not None:
             session.on("user_input_transcribed", self._on_user_input_transcribed)
+            session.on("function_tools_executed", self._on_function_tools_executed)
 
         rt_session = self._rt_session_or_none()
         if rt_session is not None:
@@ -318,6 +363,13 @@ class Assistant(Agent):
 
         self._wakeword_attached = True
         logger.info("wake-word gate attached")
+        logger.info("[MEMORY-DEBUG] wakeword gate attached; session=%s", session)
+
+    def _on_function_tools_executed(self, ev) -> None:
+        for call, output in ev.zipped():
+            status = "ok" if not output.is_error else "error"
+            logger.info("TOOL CALL: %s", call.name)
+            logger.info("TOOL RESULT STATUS: %s", status)
 
     def _rt_session_or_none(self):
         try:
@@ -335,9 +387,161 @@ class Assistant(Agent):
     def _on_user_input_transcribed(self, ev: UserInputTranscribedEvent) -> None:
         text = ev.transcript or ""
         logger.info("audio gate: transcribed %r", text)
+        logger.info(
+            "[MEMORY-DEBUG] handler received event transcript=%r is_final=%s "
+            "speaker_id=%s",
+            text,
+            ev.is_final,
+            getattr(ev, "speaker_id", None),
+        )
         if text:
             self._turn_text = text
             browser_tools.set_user_request(text)
+            if ev.is_final:
+                if not MEMORY_ROUTING_LIVE:
+                    logger.info(
+                        "memory router: live memory routing disabled (voice-first standby)"
+                    )
+                else:
+                    logger.info(
+                        "[MEMORY-DEBUG] final transcript scheduled for memory routing: %r",
+                        text,
+                    )
+                    task = asyncio.ensure_future(self._route_memory(text))
+                    self._memory_tasks.add(task)
+                    task.add_done_callback(self._memory_tasks.discard)
+                if AUTO_MEMORY_ENABLED:
+                    self._submit_auto_memory(text)
+
+    async def _route_memory(self, text: str) -> None:
+        """Deterministic memory routing for explicit write/recall commands.
+
+        Runs on the final transcript, after the wake/conversation gate accepts
+        the turn, and before/independently of Gemini's response generation: the
+        router itself persists or retrieves in code, so correctness-critical
+        memory commands never depend on the LLM choosing a tool. Provider
+        failures never raise into the voice loop.
+        """
+        try:
+            accepted = self._gate.should_accept(text)
+            logger.info(
+                "[MEMORY-DEBUG] gate decision accepted=%s text=%r", accepted, text
+            )
+            if not accepted:
+                logger.info("memory router: turn not accepted by the gate, skipping")
+                return
+            result = await memory_router.route(text)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("memory router: routing failed: %s", exc)
+            return
+        logger.info(
+            "[MEMORY-DEBUG] router decision intent=%s is_write=%s is_recall=%s "
+            "accepted=%s reason=%r count=%s",
+            result.intent.value,
+            result.is_write,
+            result.is_recall,
+            result.accepted,
+            getattr(result, "reason", None),
+            getattr(result, "count", None),
+        )
+        if result.intent is MemoryIntent.NONE:
+            return
+
+        if result.is_write:
+            if result.accepted:
+                logger.info("MEMORY ROUTER: explicit_write")
+                logger.info("MEMORY WRITE: success")
+                await self._steer_reply_after_memory(
+                    "The user asked you to remember something and it has just been "
+                    "stored in your long-term memory. Briefly confirm to the user, "
+                    "in one sentence, that you have saved it. Do not repeat the "
+                    "content unless the user asks."
+                )
+            else:
+                logger.info("MEMORY ROUTER: explicit_write")
+                logger.info("MEMORY WRITE: refused reason=%s", result.reason)
+                await self._steer_reply_after_memory(
+                    "The user asked you to remember something, but it was not stored "
+                    "because it looks like a credential or secret. Politely tell the "
+                    "user you cannot store that kind of information, without "
+                    "repeating it."
+                )
+        elif result.is_recall:
+            logger.info("MEMORY ROUTER: explicit_recall")
+            if result.accepted:
+                logger.info("MEMORY RESULTS: %d", result.count)
+                facts = "\n".join(f"- {entry.content}" for entry in result.results)
+                if len(facts) > MAX_MEMORY_CONTEXT_CHARS:
+                    facts = facts[:MAX_MEMORY_CONTEXT_CHARS]
+                await self._steer_reply_after_memory(
+                    "Answer the user's question using ONLY these facts retrieved "
+                    "from your long-term memory, keep it brief, and never invent "
+                    "details that are not in them:\n" + facts
+                )
+            else:
+                logger.info("MEMORY RESULTS: 0")
+                await self._steer_reply_after_memory(
+                    "The user asked about your long-term memory, but nothing "
+                    "matching is stored. Say truthfully and briefly that you have "
+                    "nothing stored on that; do not invent a memory."
+                )
+
+    def _submit_auto_memory(self, text: str) -> None:
+        """Schedule a best-effort background auto-memory evaluation.
+
+        Opt-in only and non-blocking: the controller returns immediately and the
+        evaluation never awaits this path. The store outcome never touches the
+        reply; only a bounded recall with matching facts may steer it.
+        """
+        try:
+            accepted = self._gate.should_accept(text)
+            logger.info(
+                "[AUTO-MEMORY] gate decision accepted=%s text=%r", accepted, text
+            )
+            self._auto_memory.submit_evaluate(
+                text, accepted=accepted, on_result=self._on_auto_memory_result
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("auto-memory: submission failed safely: %s", exc)
+
+    async def _on_auto_memory_result(self, result: AutoMemoryResult) -> None:
+        """Steer the reply only for bounded recall results; a store never replies."""
+        try:
+            facts = "\n".join(f"- {entry.content}" for entry in result.results)
+            if len(facts) > MAX_MEMORY_CONTEXT_CHARS:
+                facts = facts[:MAX_MEMORY_CONTEXT_CHARS]
+            await self._steer_reply_after_memory(
+                "Answer the user's question using ONLY these facts retrieved "
+                "from your long-term memory, keep it brief, and never invent "
+                "details that are not in them:\n" + facts
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("auto-memory: recall steering failed safely: %s", exc)
+
+    async def shutdown_auto_memory(self) -> None:
+        """Cancel and drain pending auto-memory tasks for this session.
+
+        Registered as a job shutdown callback so no background task outlives
+        the session and no "Task was destroyed but it is pending!" warning can
+        surface at teardown.
+        """
+        await self._auto_memory.shutdown()
+
+    async def _steer_reply_after_memory(self, instructions: str) -> None:
+        """Push deterministic content into the reply path (best effort).
+
+        Gemini's realtime auto-generation may already be running off the audio;
+        a text-driven ``generate_reply`` with instructions supersedes the pending
+        generation so the spoken reply is grounded in the memory facts routed by
+        the deterministic router. Any failure only logs; it never breaks the loop.
+        """
+        session = self.session
+        if session is None:
+            return
+        try:
+            await session.generate_reply(instructions=instructions)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("memory router: could not steer the reply: %s", exc)
 
     async def _gate_realtime_audio(
         self,
@@ -419,6 +623,11 @@ async def my_agent(ctx: JobContext):
         "room": ctx.room.name,
     }
 
+    from importlib.metadata import version as _pkg_version
+
+    logger.info("LIVEKIT-AGENTS VERSION: %s", _pkg_version("livekit-agents"))
+    logger.info("GOOGLE PLUGIN VERSION: %s", _pkg_version("livekit-plugins-google"))
+
     session = AgentSession(
         turn_handling=TurnHandlingOptions(
             turn_detection=inference.TurnDetector(),
@@ -429,6 +638,19 @@ async def my_agent(ctx: JobContext):
     )
 
     agent = Assistant()
+    await memory_provider.initialize()
+    if memory_provider.is_available():
+        logger.info("MEMORY HEALTH: healthy")
+    else:
+        logger.info("MEMORY HEALTH: unavailable (%s)", memory_db_path)
+    tool_names = []
+    for tool in capability_registry.tools():
+        info = getattr(tool, "info", None)
+        if info is not None:
+            tool_names.append(info.name)
+        elif hasattr(tool, "name"):
+            tool_names.append(tool.name)
+    logger.info("JARVIS ACTIVE TOOLS: %s", ", ".join(sorted(set(tool_names))))
     await session.start(
         agent=agent,
         room=ctx.room,
@@ -445,6 +667,8 @@ async def my_agent(ctx: JobContext):
     await ctx.connect()
     agent.attach_wakeword_gate()
     maintenance_scheduler.start()
+    ctx.add_shutdown_callback(agent.shutdown_auto_memory)
+    logger.info("AUTO MEMORY: %s", "ON" if AUTO_MEMORY_ENABLED else "OFF")
 
 
 if __name__ == "__main__":

@@ -36,5 +36,11 @@ KMS
 improvement_queue/
 logs/
 
+# Local SQLite long-term memory (runtime state; never committed)
+data/
+*.db
+*.db-shm
+*.db-wal
+
 # Temporary screen captures (deleted after analysis; never committed)
 screen_captures/

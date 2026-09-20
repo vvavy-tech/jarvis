@@ -88,6 +88,17 @@ _HERMES_DEEP_RE = re.compile(
     r")\b"
 )
 
+_MEMORY_EXPLICIT_RE = re.compile(
+    r"\b(?:"
+    r"remember\b|"
+    r"save\s+(?:this|that|note|a\s*note|it)|"
+    r"keep\s+(?:[\w\u2019'-]+\s+){0,3}in\s+mind|"
+    r"don[\u2019']?t\s+forget\b|"
+    r"note\s+(?:this|that|it|down)|"
+    r"store\s+(?:this|that|it)"
+    r")\b"
+)
+
 _CONSEQUENTIAL_REQUEST_RE = re.compile(
     r"\b(?:"
     r"send|create|add|post|buy|purchase|pay|approve|merge|delete|remove|"
@@ -185,6 +196,16 @@ def is_hermes_deep(text: str | None) -> bool:
 def is_hermes_request(text: str | None) -> bool:
     """Whether the utterance should be delegated to the Hermes backend."""
     return is_hermes_explicit(text) or is_hermes_deep(text)
+
+
+def is_memory_request(text: str | None) -> bool:
+    """Whether the utterance explicitly asks to remember/store something.
+
+    Memory writes are explicit-only: never persist anything unless the user
+    clearly asks to ("remember ...", "save this ...", "keep that in mind").
+    """
+    norm = normalize_text(text)
+    return bool(norm and _MEMORY_EXPLICIT_RE.search(norm))
 
 
 class ConversationGate:
@@ -406,4 +427,21 @@ class ToolGate:
                 "Only use Hermes when the user explicitly asks (such as 'ask "
                 "Hermes to analyse this') or for deep planning or development "
                 "work; otherwise answer yourself."
+            )
+
+    def ensure_memory_requested(self) -> None:
+        """Require an active conversation plus an explicit memory request.
+
+        Long-term memory is written only on explicit user intent ("remember
+        ...", "save this ...", "keep this in mind"). Never persist anything
+        proactively or from background speech.
+        """
+        self.ensure_active_conversation()
+        if not is_memory_request(self._turn_text):
+            raise ToolError(
+                "The user did not ask to save memory or remember anything. "
+                "Never store memories on your own initiative; only persist "
+                "when the user explicitly says to remember, save, or keep "
+                "something in mind, such as 'remember that ...' or 'save this "
+                "...'. Wait for an explicit request that includes 'Jarvis'."
             )

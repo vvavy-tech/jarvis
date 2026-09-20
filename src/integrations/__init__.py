@@ -40,6 +40,7 @@ __all__ = [
     "HermesIntegration",
     "Integration",
     "IntegrationStatus",
+    "MemoryIntegration",
     "MetaAdsIntegration",
     "ScreenVisionIntegration",
     "SpotifyIntegration",
@@ -56,6 +57,7 @@ def build_default_registry(
     failure_log: Any | None = None,
     external_groups: list[ToolGroup] | None = None,
     hermes_agent: Any | None = None,
+    memory_provider: Any | None = None,
 ) -> CapabilityRegistry:
     """Construct the registry with the standard capability set.
 
@@ -66,6 +68,11 @@ def build_default_registry(
     (runtime-detected) adapter is used. Hermes is always optional: with no
     installed interface the agent still starts and reports it unavailable.
 
+    ``memory_provider`` injects the durable memory backend; when omitted a
+    memory capability is still registered but reports itself unavailable.
+    Memory is always optional: the agent starts and keeps the voice loop
+    working even if the store is missing or corrupted.
+
     Optional integrations are only added if importing them does not fail. No
     shared state or credentials are required, so the agent always starts.
     """
@@ -73,6 +80,7 @@ def build_default_registry(
     for group in external_groups or []:
         registry.register(group)
     from agents.hermes_agent import HermesIntegration
+    from memory.tools import MemoryIntegration
 
     registry.register(WindowsIntegration(gate=gate, failure_log=failure_log))
     registry.register(SpotifyIntegration(gate=gate, failure_log=failure_log))
@@ -82,6 +90,9 @@ def build_default_registry(
             GoogleCalendarIntegration(gate=gate, failure_log=failure_log),
             MetaAdsIntegration(gate=gate, failure_log=failure_log),
             HermesIntegration(gate=gate, failure_log=failure_log, agent=hermes_agent),
+            MemoryIntegration(
+                gate=gate, failure_log=failure_log, provider=memory_provider
+            ),
         ]
     )
     if ScreenVisionIntegration is not None:

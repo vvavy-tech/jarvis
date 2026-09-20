@@ -192,6 +192,7 @@ class Developer:
         llm: Any | None = None,
         root: Path | None = None,
         hermes: Any | None = None,
+        memory: Any | None = None,
     ) -> None:
         resolved_root = (root or PROJECT_ROOT).resolve()
         self.project = project or ProjectAccess(resolved_root)
@@ -200,6 +201,7 @@ class Developer:
         self.runner = runner or TestRunner(resolved_root)
         self._llm = llm
         self.hermes = hermes
+        self.memory = memory
         self.root = resolved_root
 
     # ------------------------------------------------------------------ #
@@ -312,9 +314,17 @@ class Developer:
                 raise ProposalError(str(exc)) from exc
             return IntegrationScaffold.proposal_for(service, task.description)
         hermes_plan = await self._maybe_hermes_context(task)
+        memory_context = await self._maybe_memory_context(
+            f"{task.title}\n\n{task.description}"
+        )
         user = self._context_prompt(task)
-        if hermes_plan:
-            user = f"### Analysis from the Hermes backend\n{hermes_plan}\n\n" + user
+        extra: list[str] = []
+        if hermes_plan and hermes_plan.strip():
+            extra.append(f"### Analysis from the Hermes backend\n{hermes_plan}")
+        if memory_context and memory_context.strip():
+            extra.append(memory_context)
+        if extra:
+            user = "\n\n".join(extra) + "\n\n" + user
         raw = await self._ask(_SYSTEM_PROMPT, user)
         return parse_proposal(raw)
 
@@ -337,6 +347,24 @@ class Developer:
         if not result.ok or not (result.text or "").strip():
             return ""
         return result.text[:HERMES_DEV_MAX_CHARS]
+
+    async def _maybe_memory_context(self, prompt: str) -> str:
+        """Bounded, read-only memory context relevant to a Developer/Hermes task.
+
+        Memory is consulted only to inform planning (architecture decisions,
+        past lessons, integration choices). Hermes/Developer can never write to
+        it here: writes are exclusively JARVIS's explicit-request path. Any
+        failure returns an empty string.
+        """
+        if self.memory is None:
+            return ""
+        try:
+            context = await self.memory.build_context(prompt)
+        except Exception:
+            return ""
+        if not (context or "").strip():
+            return ""
+        return f"### Relevant long-term memory (read-only)\n{context}"
 
     async def _propose_repair(self, task: DevTask, problem: str) -> dict[str, Any]:
         user = (
