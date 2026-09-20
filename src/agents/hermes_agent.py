@@ -41,7 +41,7 @@ import typing
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from livekit.agents import function_tool
+from livekit.agents import RunContext, function_tool
 
 from gates import ToolGate
 from integrations.base import ActionLevel, Integration
@@ -312,7 +312,7 @@ class HermesIntegration(Integration):
     # ------------------------------------------------------------------ #
 
     @function_tool()
-    async def get_hermes_status(self, context) -> dict[str, Any]:
+    async def get_hermes_status(self, context: RunContext) -> dict[str, Any]:
         """Report the Hermes backend: whether it is available, its role, and
         its current health (healthy, unavailable, or error)."""
         self.gate.ensure_active_conversation()
@@ -327,7 +327,7 @@ class HermesIntegration(Integration):
 
     @function_tool()
     async def ask_hermes(
-        self, context, focus: str = "ask", request: str = ""
+        self, context: RunContext, focus: str = "ask", request: str = ""
     ) -> dict[str, Any]:
         """Delegate a deep planning or development request to the Hermes backend.
 
