@@ -19,6 +19,10 @@ ENV UV_COMPILE_BYTECODE=1
 ENV HF_HOME=/app/.cache/huggingface
 ENV TORCH_HOME=/app/.cache/torch
 
+# Store Playwright browsers under /app so they are copied to the appuser's home
+# in the production stage, and so the appuser can read/write them.
+ENV PLAYWRIGHT_BROWSERS_PATH=/app/.cache/ms-playwright
+
 # --- Build stage ---
 # Install dependencies, build native extensions, and prepare the application
 FROM base AS build
@@ -47,6 +51,11 @@ RUN mkdir -p src
 # This creates a virtual environment and installs all dependencies
 # Ensure your uv.lock file is checked in for consistency across environments
 RUN uv sync --locked
+
+# Install the Playwright Chromium browser and its system libraries. Runs as
+# root in the build stage, so --with-deps can apt-get the required packages.
+RUN uv run playwright install --with-deps chromium \
+  && rm -rf /var/lib/apt/lists/*
 
 # Pre-download any ML models or files the agent needs
 # This runs before COPY . . so the download layer is cached across code-only changes.

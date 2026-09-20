@@ -31,3 +31,10 @@ KMS
 
 # GitHub CLI
 .github/personal-instructions.md
+
+# JARVIS service state
+improvement_queue/
+logs/
+
+# Temporary screen captures (deleted after analysis; never committed)
+screen_captures/
