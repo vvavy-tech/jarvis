@@ -116,10 +116,14 @@ class MemoryIntegration(Integration):
     ) -> dict[str, Any]:
         """Persist a personal fact to long-term memory.
 
-        Use only when the user explicitly asks you to remember something
-        (e.g. 'remember that ...', 'save this ...', 'keep this in mind').
-        Never save passwords, API keys, tokens, or any other secret. If the
-        same fact is already saved, update it instead of adding a duplicate.
+        Use ONLY when the user explicitly asks JARVIS to remember, save, or
+        store information (e.g. 'remember that ...', 'save this ...', 'keep
+        that in mind', 'onthoud dat ...'). Never use this tool proactively for
+        ordinary statements or background speech; ordinary durable facts are
+        recorded automatically in the background by the auto-memory system,
+        which requires no tool call. Never store passwords, API keys, tokens,
+        or any other secret. If the same fact is already saved, update it
+        instead of adding a duplicate.
 
         Args:
             content: The exact fact the user asked you to remember.

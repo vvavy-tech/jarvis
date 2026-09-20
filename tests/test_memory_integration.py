@@ -665,6 +665,24 @@ class TestGeminiRoutingGuidance:
         assert "before answering" in text
         assert "what colour did i ask you" in text or "ask you to remember" in text
 
+    def test_remember_memory_tool_description_is_explicit_only(self, db_path):
+        provider = LocalSQLiteMemoryProvider(path=db_path)
+        integration = _make_memory_integration(provider)
+        tool = next(t for t in integration.tools if t.info.name == "remember_memory")
+        desc = tool.info.description.casefold()
+        assert "only when the user explicitly asks" in desc
+        assert "never use this tool proactively" in desc
+        assert "auto-memory" in desc or "automatic memory" in desc
+
+    def test_ordinary_statement_does_not_require_remember_memory(self):
+        from memory.prompt import memory_instructions
+
+        text = memory_instructions()
+        assert "without any tool call" in text
+        assert (
+            "stored automatically" in text or "automatically in the background" in text
+        )
+
     def test_agent_prompt_actually_includes_memory_instructions(self):
         from pathlib import Path
 
