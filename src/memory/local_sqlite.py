@@ -135,18 +135,7 @@ class LocalSQLiteMemoryProvider(MemoryProvider):
                     ),
                 )
 
-        logger.info(
-            "[MEMORY-DEBUG] provider store requested: id=%s content=%r category=%s",
-            entry.id,
-            entry.content,
-            entry.category,
-        )
         await asyncio.to_thread(_insert)
-        logger.info(
-            "[MEMORY-DEBUG] provider store completed: id=%s content=%r",
-            entry.id,
-            entry.content,
-        )
         return entry
 
     async def get(self, memory_id: str) -> MemoryEntry | None:

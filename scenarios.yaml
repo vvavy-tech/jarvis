@@ -114,3 +114,57 @@ scenarios:
       and it keeps helping normally. Replies are brief and in plain spoken prose.
     tags:
       feature: hermes
+
+  - label: Answers a Dutch greeting in English
+    instructions: |
+      PERSONA: A user who greets JARVIS in Dutch to check its language behaviour.
+      OPENING LINE: "Jarvis, hallo! Hoe gaat het met je?"
+      DO, IN ORDER:
+      1. Whatever it says, reply "Oké, bedankt!" and end the conversation.
+    agent_expectations: >
+      Greets back and answers fully in ENGLISH. Even though the user speaks
+      Dutch, the assistant never mirrors Dutch, never apologises for using
+      English, and never asks permission to keep using English. Replies are
+      brief and in plain spoken prose with no lists or markdown.
+    tags:
+      feature: english-always
+
+  - label: Follows up with a Dutch request inside the conversation window
+    instructions: |
+      PERSONA: JARVIS's owner, a Dutch speaker. You wake JARVIS once and then
+      continue the conversation without repeating the wake word.
+      OPENING LINE: "Jarvis, wat is er aangesloten?"
+      DO, IN ORDER:
+      1. Without saying "Jarvis" again, ask:
+         "Ik wil weten hoeveel nieuwe Shopify klanten we er vandaag bij hebben gekregen."
+      2. Accept the answer, say "Bedankt!" and end the conversation.
+      IMPORTANT: Never say "Jarvis" a second time. The follow-up must be accepted
+      while the conversation window is still open.
+    agent_expectations: >
+      Answers the first request, then answers the follow-up WITHOUT the user
+      repeating the wake word: the follow-up is a legitimately in-window request
+      and must be accepted, not treated as background speech. For the follow-up
+      it uses the shopify_new_customers tool scoped to today - never the
+      sales/orders summary tool - and states the number of new customers, or
+      honestly says the count is unavailable if Shopify is not connected. Every
+      reply, including the reply to the Dutch follow-up, is in ENGLISH; it never
+      replies in Dutch. Replies are brief and in plain spoken prose.
+    tags:
+      conversation: follow-up-window
+
+  - label: Counts new Shopify customers correctly
+    instructions: |
+      PERSONA: The store owner asking about new customer signups.
+      OPENING LINE: "Jarvis, how many new Shopify customers did we get today?"
+      DO, IN ORDER:
+      1. If the assistant asks which period, reply "today".
+      2. Accept the answer with "Perfect, thanks!" and end the conversation.
+    agent_expectations: >
+      Answers using the shopify_new_customers tool for today and must NOT use
+      the sales or orders summary tool. It reports an exact count of new
+      customers, or honestly says the count is unavailable if Shopify is not
+      connected. It never derives the count from orders or revenue and never
+      reads out customer email addresses or personal data. Replies are brief
+      and in plain spoken prose.
+    tags:
+      feature: shopify

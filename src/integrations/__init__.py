@@ -23,6 +23,7 @@ from integrations.gmail.integration import GmailIntegration
 from integrations.google_calendar.integration import GoogleCalendarIntegration
 from integrations.meta_ads.integration import MetaAdsIntegration
 from integrations.registry import CapabilityRegistry
+from integrations.shopify.integration import ShopifyIntegration
 from integrations.spotify.integration import SpotifyIntegration
 from integrations.windows_integration import WindowsIntegration
 
@@ -43,6 +44,7 @@ __all__ = [
     "MemoryIntegration",
     "MetaAdsIntegration",
     "ScreenVisionIntegration",
+    "ShopifyIntegration",
     "SpotifyIntegration",
     "ToolGroup",
     "WindowsIntegration",
@@ -89,6 +91,7 @@ def build_default_registry(
             GmailIntegration(gate=gate, failure_log=failure_log),
             GoogleCalendarIntegration(gate=gate, failure_log=failure_log),
             MetaAdsIntegration(gate=gate, failure_log=failure_log),
+            ShopifyIntegration(gate=gate, failure_log=failure_log),
             HermesIntegration(gate=gate, failure_log=failure_log, agent=hermes_agent),
             MemoryIntegration(
                 gate=gate, failure_log=failure_log, provider=memory_provider

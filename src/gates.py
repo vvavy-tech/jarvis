@@ -7,6 +7,10 @@ from livekit.agents.llm import ToolError
 
 _WAKE_WORD = "jarvis"
 
+# Known ASR mis-transcriptions of "Jarvis". Only accepted at utterance start
+# (not embedded in arbitrary speech) to avoid false-positive wake-ups.
+_WAKE_ALIAS_AT_START_RE = re.compile(r"^[^\w]*(javis|travis|jarves|jarviss)\b")
+
 CONVERSATION_TIMEOUT_SECONDS = 25.0
 
 _SLEEP_COMMAND_RE = re.compile(
@@ -150,7 +154,11 @@ def normalize_text(text: str | None) -> str:
 
 
 def has_wake_word(text: str | None) -> bool:
-    return _WAKE_WORD in normalize_text(text)
+    norm = normalize_text(text)
+    result = _WAKE_WORD in norm
+    if not result:
+        result = bool(_WAKE_ALIAS_AT_START_RE.search(norm))
+    return result
 
 
 def is_confirmation(text: str | None) -> bool:
@@ -291,6 +299,21 @@ class ToolGate:
     def current_turn_text(self) -> str | None:
         return self._turn_text
 
+    def adopt_user_item_text(self, text: str | None) -> bool:
+        """Populate the gate's turn text from a committed user conversation item.
+
+        The realtime model can answer preemptively and fire a tool call before
+        ``user_input_transcribed`` lands, at which point ``_turn_text`` is still
+        empty even though the user's message (with the wake word) is already in
+        the chat context. This adopts that committed text, but only when no
+        fresher transcript has already populated the turn, so a late item commit
+        can never overwrite the current turn or re-open a closed window.
+        """
+        if not text or self._turn_text:
+            return False
+        self._turn_text = text
+        return True
+
     def should_accept(self, text: str | None = None) -> bool:
         return self._conversation.should_accept(
             text if text is not None else self._turn_text
@@ -312,8 +335,40 @@ class ToolGate:
         else:
             self._browser_armed = False
 
+    def _authorize_by_window(self) -> bool:
+        """Authorize the current turn on conversation-window state only.
+
+        Real-time models answer preemptively, so a follow-up tool call can race
+        ahead of the user's transcribed text: ``input_speech_started`` clears
+        ``_turn_text`` and the model can emit a tool call before the first
+        partial transcript lands. A genuine in-window follow-up must not be
+        rejected merely because ``_turn_text`` is momentarily empty, so tool
+        authorization is driven by the conversation window rather than by the
+        presence of the transcript.
+
+        Sleep protection is unchanged: only the wake word opens the window and
+        background speech while asleep never authorizes anything. Explicit
+        sleep phrases still close the window immediately.
+        """
+        norm = normalize_text(self._turn_text)
+        if self._conversation.is_active():
+            if is_sleep_command(norm):
+                self._conversation.deactivate()
+                return True
+            if norm.strip():
+                self._conversation.refresh()
+            return True
+        if not norm.strip():
+            return False
+        if has_wake_word(norm):
+            self._conversation.activate()
+            return True
+        if is_sleep_command(norm):
+            return False
+        return False
+
     def ensure_wake_word(self) -> None:
-        if not self.should_accept():
+        if not self._authorize_by_window():
             raise ToolError(
                 "The user did not say the wake word 'Jarvis' or start an "
                 "active conversation. Do not call any tool or take any "
@@ -322,7 +377,7 @@ class ToolGate:
 
     def ensure_active_conversation(self) -> None:
         """Require the wake word or an already-active conversation window."""
-        if not self.should_accept():
+        if not self._authorize_by_window():
             raise ToolError(
                 "The user did not say the wake word 'Jarvis' or start an "
                 "active conversation. Do not call any tool or take any "
