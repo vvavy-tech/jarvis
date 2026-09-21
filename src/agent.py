@@ -410,8 +410,9 @@ class Assistant(Agent):
         ``user_input_transcribed`` lands (its partial/final transcript). The
         committed user conversation item is inserted into the chat context
         before the model generates, so it is the earliest reliable copy of the
-        user's text. It is used only when no fresher transcript has already
-        populated the gate (see ``ToolGate.adopt_user_item_text``).
+        user's text. ASR can also commit a stale partial fragment first, so the
+        commit is treated as authoritative and replaces the current turn text
+        (see ``ToolGate.adopt_user_item_text``).
         """
         item = getattr(ev, "item", None)
         if item is None or getattr(item, "role", None) != "user":
@@ -419,7 +420,7 @@ class Assistant(Agent):
         text = item.raw_text_content or ""
         if not self._gate.adopt_user_item_text(text):
             return
-        logger.info("audio gate: conversation user item filled turn_text %r", text)
+        logger.info("audio gate: conversation user item set turn_text %r", text)
         self._turn_text = text
 
     def _on_user_input_transcribed(self, ev: UserInputTranscribedEvent) -> None:

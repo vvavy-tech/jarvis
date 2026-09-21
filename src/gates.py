@@ -300,18 +300,24 @@ class ToolGate:
         return self._turn_text
 
     def adopt_user_item_text(self, text: str | None) -> bool:
-        """Populate the gate's turn text from a committed user conversation item.
+        """Treat the committed user conversation item as authoritative for the turn.
 
         The realtime model can answer preemptively and fire a tool call before
-        ``user_input_transcribed`` lands, at which point ``_turn_text`` is still
-        empty even though the user's message (with the wake word) is already in
-        the chat context. This adopts that committed text, but only when no
-        fresher transcript has already populated the turn, so a late item commit
-        can never overwrite the current turn or re-open a closed window.
+        ``user_input_transcribed`` lands, so the committed role=user item is the
+        earliest reliable copy of the user's text. ASR may also commit a stale or
+        partial fragment (e.g. "bra") before the authoritative full utterance
+        arrives. A later committed item therefore *replaces* the current turn
+        text (re-deriving browser arming) instead of only filling it when empty.
+        Idempotent re-commits of identical text are ignored.
+
+        The commit never touches the conversation window itself: waking up still
+        requires ``_authorize_by_window`` to see the wake word at tool-call time,
+        so a committed item without "Jarvis" can never activate a sleeping
+        conversation and an explicit sleep is unaffected.
         """
-        if not text or self._turn_text:
+        if not text or text == self._turn_text:
             return False
-        self._turn_text = text
+        self.set_user_request(text)
         return True
 
     def should_accept(self, text: str | None = None) -> bool:

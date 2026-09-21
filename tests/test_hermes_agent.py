@@ -1,12 +1,14 @@
 """Behaviour tests for the Hermes backend adapter.
 
 The adapter must detect a real Hermes interface at runtime, run it as an
-isolated subprocess, enforce a configurable timeout, and never throw into the
-voice loop. It must log op / outcome / duration only, never request content.
+isolated subprocess via the official one-shot ``-z "<prompt>"`` contract,
+enforce a configurable timeout, and never throw into the voice loop. It must
+log op / outcome / duration only, never request content.
 """
 
 import asyncio
 import logging
+import os
 import sys
 
 import pytest
@@ -26,7 +28,8 @@ def _clean_env(monkeypatch):
 def _script(tmp_path, body: str, name: str = "hermes.py") -> str:
     path = tmp_path / name
     path.write_text(
-        "import sys, time\nop = sys.argv[-1]\nbody = sys.stdin.read()\n" + body,
+        "import sys, time\nprompt = sys.argv[-1]\n"
+        "out = getattr(sys.stdout, 'buffer', sys.stdout)\n" + body,
         encoding="utf-8",
     )
     return str(path)
@@ -36,10 +39,17 @@ def _no_hermes_on_path(monkeypatch):
     monkeypatch.setattr(ha.shutil, "which", lambda _name: None)
 
 
-ECHO = "sys.stdout.write(f'{op}:{body}')\nsys.stdout.flush()\n"
+def _prompt(focus: str, request: str) -> str:
+    return f"Focus: {focus}\nRequest: {request}"
+
+
+ECHO = "out.write(prompt.encode())\nout.flush()\n"
 EMPTY = "pass\n"
 FAIL = "sys.stderr.write('boom detail\\n')\nsys.exit(3)\n"
-SLEEP_AND_MARK = "open(sys.argv[-2], 'a').write('x')\ntime.sleep(30)\n"
+SLEEP_AND_MARK = (
+    "mark = sys.argv[1] if len(sys.argv) > 3 else __file__\n"
+    "open(mark, 'a').write('x')\ntime.sleep(30)\n"
+)
 
 
 class TestAvailability:
@@ -49,8 +59,36 @@ class TestAvailability:
 
     def test_env_command_enables(self, monkeypatch):
         _no_hermes_on_path(monkeypatch)
-        monkeypatch.setenv("HERMES_COMMAND", "hermes-agent")
+        monkeypatch.setenv("HERMES_COMMAND", sys.executable)
         assert HermesAgent().is_available() is True
+
+    def test_env_command_plain_windows_path_used_verbatim(self, monkeypatch):
+        """B3 regression - a plain Windows path in HERMES_COMMAND must be used
+        verbatim, never shell-parsed (which strips the backslashes)."""
+        _no_hermes_on_path(monkeypatch)
+        monkeypatch.setenv("HERMES_COMMAND", sys.executable)
+        resolved = HermesAgent()._resolve_command()
+        assert resolved == [sys.executable]
+        assert os.path.exists(resolved[0])
+
+    def test_env_command_prefix_is_split(self, monkeypatch):
+        _no_hermes_on_path(monkeypatch)
+        monkeypatch.setenv("HERMES_COMMAND", f"{sys.executable} -O unused.py")
+        resolved = HermesAgent()._resolve_command()
+        assert resolved == [sys.executable, "-O", "unused.py"]
+        assert ha.os.path.exists(resolved[0])
+
+    def test_unresolvable_env_command_falls_back_to_path(self, monkeypatch):
+        monkeypatch.setenv("HERMES_COMMAND", "hermes_nope_x")
+        monkeypatch.setattr(
+            ha.shutil,
+            "which",
+            lambda name: "C:/hermes/hermes.exe" if name == "hermes" else None,
+        )
+        assert HermesAgent()._resolve_command() == ["C:/hermes/hermes.exe"]
+        # unset: PATH search is used directly
+        monkeypatch.delenv("HERMES_COMMAND", raising=False)
+        assert HermesAgent()._resolve_command() == ["C:/hermes/hermes.exe"]
 
     def test_injected_command_enables(self, tmp_path):
         script = _script(tmp_path, ECHO)
@@ -71,22 +109,53 @@ class TestAvailability:
 
 class TestExecution:
     @pytest.mark.asyncio
-    async def test_ask_passes_op_and_request(self, tmp_path):
+    async def test_subprocess_argv_is_dash_z_with_prompt(self, tmp_path):
+        """The one-shot form is ``-z "<prompt>"``; focus and request travel
+        inside the prompt text, with no separate ``ask``-style command."""
+        script = _script(tmp_path, ECHO)
+        agent = HermesAgent(command=[sys.executable, script], timeout_s=10)
+        spawned: list[list[str]] = []
+        original = asyncio.create_subprocess_exec
+
+        async def _spy(*args, **kwargs):
+            spawned.append(list(args))
+            return await original(*args, **kwargs)
+
+        asyncio.create_subprocess_exec = _spy
+        try:
+            result = await agent.ask("explain the difference between REST and GraphQL")
+        finally:
+            asyncio.create_subprocess_exec = original
+
+        assert len(spawned) == 1
+        argv = spawned[0]
+        assert argv[:2] == [sys.executable, script]
+        assert argv[2] == "-z"
+        assert argv[3] == _prompt(
+            "ask", "explain the difference between REST and GraphQL"
+        )
+        assert result.ok is True
+        assert result.text == _prompt(
+            "ask", "explain the difference between REST and GraphQL"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ask_uses_one_shot_contract(self, tmp_path):
         script = _script(tmp_path, ECHO)
         agent = HermesAgent(command=[sys.executable, script], timeout_s=10)
         result = await agent.ask("refactor the router")
         assert result.ok is True
         assert result.outcome == "success"
-        assert result.text == "ask:refactor the router"
+        assert result.text == _prompt("ask", "refactor the router")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("focus", ["ask", "plan", "analyse", "develop"])
-    async def test_all_ops_dispatch_their_focus(self, tmp_path, focus):
+    async def test_all_ops_encode_focus_into_prompt(self, tmp_path, focus):
         script = _script(tmp_path, ECHO)
         agent = HermesAgent(command=[sys.executable, script], timeout_s=10)
         result = await getattr(agent, focus)("design the module")
         assert result.ok is True
-        assert result.text == f"{focus}:design the module"
+        assert result.text == _prompt(focus, "design the module")
 
     @pytest.mark.asyncio
     async def test_empty_output_is_malformed(self, tmp_path):

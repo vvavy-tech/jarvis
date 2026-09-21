@@ -594,11 +594,13 @@ class TestToolAuthorizationInWindow:
 
 
 class TestAdoptUserItemText:
-    """Regression: the realtime model fires a tool call before
-    ``user_input_transcribed`` lands, so the committed user conversation item
-    fills the gate's turn text first. It must be adopted only when the current
-    turn is still empty, never overwriting a fresher transcript or the next
-    utterance after ``input_speech_started`` cleared the text.
+    """Regression: the committed role=user conversation item is the
+    authoritative text for the current turn. The realtime model can fire a tool
+    call before ``user_input_transcribed`` lands, and ASR can commit a stale
+    partial fragment (e.g. "bra") before the real full utterance arrives. A
+    later committed item must therefore replace the turn text, not only fill it
+    when empty. Idempotent re-commits are ignored, and the commit never re-opens
+    a closed conversation window by itself.
     """
 
     def test_adopts_committed_item_when_turn_empty(self):
@@ -622,12 +624,20 @@ class TestAdoptUserItemText:
         gate.set_user_request("")
         gate.ensure_action_level(int(ActionLevel.SAFE_READ))
 
-    def test_does_not_overwrite_existing_transcript(self):
+    def test_committed_item_is_authoritative_over_transcript(self):
         gate = ToolGate()
         gate.set_user_request("Jarvis, show the campaign performance")
         adopted = gate.adopt_user_item_text("Jarvis, play some music")
-        assert adopted is False
-        assert gate.current_turn_text == "Jarvis, show the campaign performance"
+        assert adopted is True
+        assert gate.current_turn_text == "Jarvis, play some music"
+        gate.ensure_action_level(int(ActionLevel.SAFE_READ))
+
+    def test_identical_commit_is_idempotent(self):
+        gate = ToolGate()
+        gate.set_user_request("")
+        assert gate.adopt_user_item_text("Jarvis, play some music") is True
+        assert gate.adopt_user_item_text("Jarvis, play some music") is False
+        assert gate.current_turn_text == "Jarvis, play some music"
 
     def test_empty_or_none_text_never_adopted(self):
         gate = ToolGate()
@@ -639,5 +649,73 @@ class TestAdoptUserItemText:
         gate = ToolGate()
         gate.set_user_request("")
         gate.adopt_user_item_text("wat is er aangesloten?")
+        with pytest.raises(ToolError, match="Jarvis"):
+            gate.ensure_action_level(int(ActionLevel.SAFE_READ))
+
+    def test_stale_partial_replaced_by_committed_wake_turn_allowed(self):
+        # 1. the stale partial commit is populated, then correctly rejected.
+        gate = ToolGate()
+        assert gate.adopt_user_item_text("bra") is True
+        with pytest.raises(ToolError, match="Jarvis"):
+            gate.ensure_hermes_requested()
+        # 2. the authoritative committed item replaces it and authorizes.
+        assert (
+            gate.adopt_user_item_text(
+                "Jarvis, ask Hermes to explain the difference between REST and GraphQL."
+            )
+            is True
+        )
+        gate.ensure_hermes_requested()
+
+    def test_stale_partial_replaced_by_non_wake_turn_stays_blocked_while_asleep(self):
+        # 2. asleep + committed text without the wake word cannot activate it.
+        gate = ToolGate()
+        gate.deactivate()
+        gate.adopt_user_item_text("bra")
+        gate.adopt_user_item_text("wat is er aangesloten?")
+        assert gate.is_conversation_active() is False
+        with pytest.raises(ToolError, match="Jarvis"):
+            gate.ensure_hermes_requested()
+        with pytest.raises(ToolError, match="Jarvis"):
+            gate.ensure_action_level(int(ActionLevel.SAFE_READ))
+
+    def test_committed_wake_item_replaces_stale_partial_text(self):
+        # 3. a committed Jarvis item replaces the stale partial turn text.
+        gate = ToolGate()
+        gate.adopt_user_item_text("bra")
+        gate.adopt_user_item_text("Jarvis, ask Hermes to analyse the crash log.")
+        assert gate.current_turn_text == (
+            "Jarvis, ask Hermes to analyse the crash log."
+        )
+        gate.ensure_hermes_requested()
+
+    def test_normal_wake_first_turn_still_works(self):
+        # 4. a normal first "Jarvis" turn still opens the window.
+        gate = ToolGate()
+        gate.set_user_request("Jarvis, what is the weather?")
+        gate.ensure_action_level(int(ActionLevel.SAFE_READ))
+        assert gate.is_conversation_active() is True
+
+    def test_active_window_follow_up_still_allowed(self):
+        # 5. follow-up turns inside the active window remain allowed.
+        clock = _FixedClock(0.0)
+        gate = ToolGate(conversation=ConversationGate(timeout_s=25.0, now=clock))
+        gate.set_user_request("Jarvis, open the campaign page")
+        gate.ensure_action_level(int(ActionLevel.SAFE_READ))
+        clock.t = 10.0
+        gate.set_user_request("scroll to the bottom")
+        gate.ensure_action_level(int(ActionLevel.SAFE_READ))
+        assert gate.is_conversation_active() is True
+
+    def test_sleep_command_still_disables_immediately(self):
+        # 6. the sleep command still closes the window right away.
+        clock = _FixedClock(0.0)
+        gate = ToolGate(conversation=ConversationGate(timeout_s=25.0, now=clock))
+        gate.set_user_request("Jarvis, tell me a joke")
+        gate.ensure_action_level(int(ActionLevel.SAFE_READ))
+        clock.t = 5.0
+        gate.set_user_request("go to sleep")
+        gate.ensure_action_level(int(ActionLevel.SAFE_READ))  # goodbye allowed
+        assert gate.is_conversation_active() is False
         with pytest.raises(ToolError, match="Jarvis"):
             gate.ensure_action_level(int(ActionLevel.SAFE_READ))

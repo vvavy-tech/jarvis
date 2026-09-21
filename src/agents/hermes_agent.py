@@ -9,9 +9,11 @@ Interface detection order:
 1. ``HERMES_COMMAND`` environment variable (any executable or command prefix).
 2. An executable named ``hermes`` on ``PATH`` (``shutil.which``).
 
-CLI contract for the detected executable: JARVIS invokes
-``<command> <focus>`` where ``focus`` is one of ``ask``, ``plan``, ``analyse``,
-``develop``, and writes the full user request to the process stdin. Hermes must
+CLI contract for the detected executable: JARVIS invokes the official Hermes
+one-shot form ``<command> -z "<prompt>"``. The prompt is built as
+``Focus: <focus>\\nRequest: <user request>`` so the focus (``ask``, ``plan``,
+``analyse``, ``develop``) is carried inside the prompt text, never as a
+separate command (``hermes ask`` etc. are not supported commands). Hermes must
 answer on stdout; a non-zero exit code is a failure and empty stdout is treated
 as malformed output.
 
@@ -23,6 +25,12 @@ Process and failure isolation:
 - there is no retry loop;
 - timeout, crash, unavailable, and malformed output are returned as a
   :class:`HermesResult` and never raised into the voice loop.
+
+``HERMES_COMMAND`` is read as an executable path first: the whole value is used
+verbatim when it resolves to a file (important on Windows, where the path
+``C:\\...\\hermes.exe`` must not be shell-parsed, which would strip the
+backslashes). Only when it does not resolve is it split as an
+executable-plus-arguments prefix such as ``python -m hermes_cli``.
 
 Logging records only the op, outcome, and duration - never request content or
 output, so secrets and user content stay out of the logs.
@@ -42,6 +50,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from livekit.agents import RunContext, function_tool
+from livekit.agents.llm import ToolError
 
 from gates import ToolGate
 from integrations.base import ActionLevel, Integration
@@ -110,12 +119,36 @@ class HermesAgent:
     # detection
     # ------------------------------------------------------------------ #
 
+    def _parse_command(self, raw: str) -> list[str] | None:
+        """Turn a ``HERMES_COMMAND`` value into an argv list.
+
+        Order matters: the whole value is first treated as a single executable
+        path and used verbatim when it resolves. This keeps a plain Windows path
+        like ``C:\\Users\\Me\\AppData\\Local\\hermes\\bin\\hermes.exe`` intact
+        (shell-parsing it would strip the backslashes). Only when the value does
+        not resolve is it split as an executable-plus-arguments prefix (e.g.
+        ``python -m hermes_cli``); on Windows a second, backslash-preserving
+        split is tried when the first one does not resolve.
+        """
+        if not raw.strip():
+            return None
+        if os.path.exists(raw) or shutil.which(raw):
+            return [raw]
+        candidates = [shlex.split(raw)]
+        if os.name == "nt":
+            candidates.append(shlex.split(raw, posix=False))
+        for parts in candidates:
+            if parts and (os.path.exists(parts[0]) or shutil.which(parts[0])):
+                return parts
+        return None
+
     def _resolve_command(self) -> list[str] | None:
         if self._command is not None:
             return list(self._command)
         raw = os.environ.get("HERMES_COMMAND", "")
-        if raw.strip():
-            return shlex.split(raw)
+        command = self._parse_command(raw)
+        if command is not None:
+            return command
         found = shutil.which("hermes")
         if found:
             return [found]
@@ -158,12 +191,13 @@ class HermesAgent:
             if not (request or "").strip():
                 return self._record(focus, "malformed", 0, note="empty request")
 
+            prompt = f"Focus: {focus}\nRequest: {(request or '').strip()}"
             started = asyncio.get_running_loop().time()
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    command[0],
-                    *command[1:],
-                    focus,
+                    *command,
+                    "-z",
+                    prompt,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -175,10 +209,9 @@ class HermesAgent:
                     focus, "error", elapsed_ms, note=f"could not start: {exc}"
                 )
 
-            request_bytes = (request or "").encode("utf-8", "replace")
             try:
                 stdout, _stderr = await asyncio.wait_for(
-                    proc.communicate(request_bytes), timeout=self._timeout_s
+                    proc.communicate(), timeout=self._timeout_s
                 )
             except asyncio.TimeoutError:
                 with contextlib.suppress(ProcessLookupError):
@@ -357,9 +390,4 @@ class HermesIntegration(Integration):
         note = result.note or ""
         message = self._STATUS_MESSAGES.get(result.outcome, "Hermes failed.")
         message += f" ({note})" if note else ""
-        return {
-            "status": result.outcome,
-            "focus": focus,
-            "summary": "",
-            "message": message,
-        }
+        raise ToolError(message)

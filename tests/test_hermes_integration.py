@@ -2,7 +2,9 @@
 voice tools' failure isolation, and the Developer Mode planning hook.
 
 Hermes must never break JARVIS: when it is missing or fails, status reflects
-that and no tool raises into the voice loop.
+that. HermesAgent.run never raises; the ask_hermes voice tool reports failures
+as a LiveKit ToolError so the tool result status in diagnostics is an error,
+never a success, while the model is still told to continue helping.
 """
 
 import asyncio
@@ -246,13 +248,12 @@ class TestVoiceTools:
         with pytest.raises(ToolError, match="wake word"):
             run_sync(integration.ask_hermes(None, focus="plan", request="x"))
 
-    def test_unavailable_does_not_raise(self):
+    def test_unavailable_raises_tool_error(self):
         integration = _make_integration(_FakeHermes(available=False))
-        result = run_sync(integration.ask_hermes(None, focus="plan", request="x"))
-        assert result["status"] == "unavailable"
-        assert "not available" in result["message"].casefold()
+        with pytest.raises(ToolError, match="not available"):
+            run_sync(integration.ask_hermes(None, focus="plan", request="x"))
 
-    def test_error_result_does_not_raise(self):
+    def test_error_result_raises_tool_error(self):
         fake = _FakeHermes(
             available=True,
             result=HermesResult(
@@ -260,11 +261,10 @@ class TestVoiceTools:
             ),
         )
         integration = _make_integration(fake)
-        result = run_sync(integration.ask_hermes(None, focus="plan", request="x"))
-        assert result["status"] == "error"
-        assert "exit code 3" in result["message"]
+        with pytest.raises(ToolError, match="exit code 3"):
+            run_sync(integration.ask_hermes(None, focus="plan", request="x"))
 
-    def test_timeout_does_not_raise(self):
+    def test_timeout_raises_tool_error(self):
         fake = _FakeHermes(
             available=True,
             result=HermesResult(
@@ -272,10 +272,10 @@ class TestVoiceTools:
             ),
         )
         integration = _make_integration(fake)
-        result = run_sync(integration.ask_hermes(None, focus="develop", request="x"))
-        assert result["status"] == "timeout"
+        with pytest.raises(ToolError, match="did not answer in time"):
+            run_sync(integration.ask_hermes(None, focus="develop", request="x"))
 
-    def test_malformed_does_not_raise(self):
+    def test_malformed_raises_tool_error(self):
         fake = _FakeHermes(
             available=True,
             result=HermesResult(
@@ -283,8 +283,8 @@ class TestVoiceTools:
             ),
         )
         integration = _make_integration(fake)
-        result = run_sync(integration.ask_hermes(None, focus="analyse", request="x"))
-        assert result["status"] == "malformed"
+        with pytest.raises(ToolError, match="empty answer"):
+            run_sync(integration.ask_hermes(None, focus="analyse", request="x"))
 
     def test_ask_hermes_is_reversible_level_with_status_read(self):
         integration = _make_integration(_FakeHermes(available=True))
